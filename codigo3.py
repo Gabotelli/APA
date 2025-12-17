@@ -5,9 +5,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
+# Modelos
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import make_pipeline
 from sklearn.utils.class_weight import compute_sample_weight
 
 # ==========================================
@@ -24,19 +26,17 @@ test['Accept'] = np.nan
 df_all = pd.concat([train, test], axis=0).reset_index(drop=True)
 
 # ==========================================
-# 2. LIMPIEZA AVANZADA
+# 2. FEATURE ENGINEERING (BASE SÓLIDA V19)
 # ==========================================
-print("--- 2. Limpieza y Feature Engineering ---")
+print("--- 2. Feature Engineering ---")
 
-# A. Moneda
+if 'BalanceGross' in df_all.columns: df_all.drop(columns=['BalanceGross'], inplace=True)
+
 def clean_currency(x):
-    if isinstance(x, str):
-        return float(x.replace('$', '').replace(',', '').strip())
+    if isinstance(x, str): return float(x.replace('$', '').replace(',', '').strip())
     return x
-for col in ['DisbursementGross', 'BalanceGross']:
-    if col in df_all.columns: df_all[col] = df_all[col].apply(clean_currency)
+df_all['DisbursementGross'] = df_all['DisbursementGross'].apply(clean_currency)
 
-# B. ApprovalFY
 def clean_approval_fy(x):
     if pd.isna(x): return np.nan
     x = str(x).replace('A', '').strip() 
@@ -44,181 +44,171 @@ def clean_approval_fy(x):
     except: return np.nan
 df_all['ApprovalFY'] = df_all['ApprovalFY'].apply(clean_approval_fy)
 
-# C. Fechas y CORRECCIÓN DE AÑOS FUTUROS
-date_cols = ['ApprovalDate', 'DisbursementDate']
-for col in date_cols:
+for col in ['ApprovalDate', 'DisbursementDate']:
     df_all[col] = pd.to_datetime(df_all[col], errors='coerce')
-    # Extraer año
     years = df_all[col].dt.year
-    # Corregir años locos (ej: 2068 -> 1968)
     years = years.apply(lambda y: y - 100 if y > 2025 else y)
     df_all[f'{col}_Year'] = years
-    df_all[f'{col}_Month'] = df_all[col].dt.month
 
 df_all['Days_To_Disbursement'] = (df_all['DisbursementDate'] - df_all['ApprovalDate']).dt.days
 
-# D. Categóricas y Valores Sucios (RevLineCr)
-def clean_revline(x):
-    if str(x) in ['Y', 'T', '1']: return 1
-    if str(x) in ['N', '0']: return 0
-    return np.nan # Dejar nulo para imputar
-df_all['RevLineCr'] = df_all['RevLineCr'].apply(clean_revline)
+# NLP Selectivo
+df_all['Name'] = df_all['Name'].fillna('').astype(str).str.upper()
+df_all['Legal_Entity'] = df_all['Name'].apply(lambda x: 1 if any(w in x for w in ['LLC', 'INC', 'CORP', 'LTD']) else 0)
+df_all['Sector_Risk'] = df_all['Name'].apply(lambda x: 1 if any(w in x for w in ['REALTY', 'ESTATE', 'CONST', 'BUILD', 'DEV']) else 0)
 
-def clean_lowdoc(x):
-    if str(x) in ['Y', '1']: return 1
-    if str(x) in ['N', '0', 'A', 'S']: return 0 # Asumimos raros como NO
-    return np.nan
-df_all['LowDoc'] = df_all['LowDoc'].apply(clean_lowdoc)
+# Categóricas
+def clean_binary(x):
+    return 1 if str(x).upper() in ['Y','T','1'] else 0
+df_all['RevLineCr'] = df_all['RevLineCr'].apply(clean_binary)
+df_all['LowDoc'] = df_all['LowDoc'].apply(clean_binary)
 
 df_all['StateSame'] = (df_all['State'] == df_all['BankState']).astype(int)
+df_all['IsFranchise'] = df_all['FranchiseCode'].apply(lambda x: 0 if x <= 1 else 1)
+df_all['NewExist'] = df_all['NewExist'].replace({0.0: 1.0, np.nan: 1.0})
 
-# Recesión basada en año corregido
-if 'DisbursementDate_Year' in df_all.columns:
-    df_all['IsRecession'] = df_all['DisbursementDate_Year'].apply(lambda x: 1 if 2007 <= x <= 2009 else 0)
-
+# Ratios
 df_all['NoEmp'] = df_all['NoEmp'].replace(0, 1)
-df_all['Amount_Per_Emp'] = df_all['DisbursementGross'] / df_all['NoEmp']
+df_all['Loan_Per_Emp'] = df_all['DisbursementGross'] / df_all['NoEmp']
+df_all['TotalJobs'] = df_all['CreateJob'] + df_all['RetainedJob']
+df_all['RevLine_Urban'] = df_all['RevLineCr'] * df_all['UrbanRural']
 
 # ==========================================
-# 3. ESTRATEGIA: AGRUPACIÓN & DROPS
+# 3. ENCODING
 # ==========================================
-# Eliminar columna State si tiene 1 solo valor (detectado en análisis)
-if df_all['State'].nunique() <= 1:
-    print(">> Eliminando columna 'State' (Informatividad cero)")
-    df_all.drop(columns=['State'], inplace=True, errors='ignore')
-    cat_cols_low = ['NewExist', 'UrbanRural'] # Quitamos State de la lista
-else:
-    cat_cols_low = ['State', 'NewExist', 'UrbanRural']
+if df_all['State'].nunique() <= 1: df_all.drop(columns=['State'], inplace=True, errors='ignore')
 
-def group_rare_labels(df, col, n_top=20):
+def group_rare(df, col, n=40):
     if col not in df.columns: return df, None
-    top = df[col].value_counts().head(n_top).index.tolist()
-    new_col = f'{col}_Grouped'
-    df[new_col] = df[col].apply(lambda x: x if x in top else 'Other_Small')
-    return df, new_col
+    top = df[col].value_counts().head(n).index.tolist()
+    df[f'{col}_Grouped'] = df[col].apply(lambda x: x if x in top else 'Other')
+    return df, f'{col}_Grouped'
 
-df_all, bank_col_grouped = group_rare_labels(df_all, 'Bank', 15) 
-df_all, city_col_grouped = group_rare_labels(df_all, 'City', 50)
-
-# ==========================================
-# 4. ENCODING
-# ==========================================
-cat_cols_high = [c for c in [bank_col_grouped, city_col_grouped, 'BankState', 'FranchiseCode'] if c]
+df_all, bank_col = group_rare(df_all, 'Bank', 50)
+df_all, city_col = group_rare(df_all, 'City', 80)
 
 le = LabelEncoder()
-for col in cat_cols_low:
+for col in ['NewExist', 'UrbanRural', 'BankState']:
     df_all[col] = df_all[col].astype(str)
     df_all[col] = le.fit_transform(df_all[col])
 
-cols_to_drop = ['id', 'LoanNr_ChkDgt', 'Name', 'ApprovalDate', 'DisbursementDate', 
-                'is_train', 'Accept', 'Bank', 'City']
+# Target Encoding
+cols_drop = ['id', 'LoanNr_ChkDgt', 'Name', 'ApprovalDate', 'DisbursementDate', 
+             'is_train', 'Accept', 'Bank', 'City']
+cat_cols_te = [c for c in [bank_col, city_col, 'FranchiseCode'] if c]
 
 df_train = df_all[df_all['is_train'] == 1].copy()
 df_test = df_all[df_all['is_train'] == 0].copy()
 y = df_train['Accept'].astype(int)
 
-# Target Encoding
-for col in cat_cols_high:
-    mapping = df_train.groupby(col)['Accept'].mean()
-    df_train[f'{col}_TE'] = df_train[col].map(mapping)
-    df_test[f'{col}_TE'] = df_test[col].map(mapping)
-    
+for col in cat_cols_te:
     global_mean = y.mean()
-    df_train[f'{col}_TE'] = df_train[f'{col}_TE'].fillna(global_mean)
-    df_test[f'{col}_TE'] = df_test[f'{col}_TE'].fillna(global_mean)
-    cols_to_drop.append(col)
+    agg = df_train.groupby(col)['Accept'].agg(['count', 'mean'])
+    smooth = (agg['count'] * agg['mean'] + 20 * global_mean) / (agg['count'] + 20)
+    df_train[f'{col}_TE'] = df_train[col].map(smooth).fillna(global_mean)
+    df_test[f'{col}_TE'] = df_test[col].map(smooth).fillna(global_mean)
+    cols_drop.append(col)
 
-X = df_train.drop(columns=cols_to_drop)
-X_test_final = df_test.drop(columns=cols_to_drop)
+X = df_train.drop(columns=cols_drop, errors='ignore')
+X_test_final = df_test.drop(columns=cols_drop, errors='ignore')
 
+# Imputación
 imputer = SimpleImputer(strategy='median')
 X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 X_test_imputed = pd.DataFrame(imputer.transform(X_test_final), columns=X_test_final.columns)
-X_test_imputed['original_index'] = X_test_imputed.index
 
 # ==========================================
-# 5. MODELADO CON PESOS DE CLASE (BALANCEO)
+# 4. FASE ACADÉMICA (CUMPLIMIENTO)
 # ==========================================
 print("\n" + "="*50)
-print("   ENTRENAMIENTO TIME-SPLIT BALANCEADO")
+print("   FASE 1: TESTEO DE MODELOS (REQUISITOS)")
 print("="*50)
 
-# Calculamos pesos para corregir el desbalanceo
-# Si Accept=0 es minoría, tendrá peso > 1. Si Accept=1 es mayoría, peso < 1.
-# Esto obliga al modelo a prestar atención a los ceros.
-sample_weights_global = compute_sample_weight(class_weight='balanced', y=y)
+X_tr, X_val, y_tr, y_val = train_test_split(X_imputed, y, test_size=0.2, random_state=42, stratify=y)
 
-SPLIT_YEAR = 2006
+# Requisito 1: Árbol
+dt = DecisionTreeClassifier(max_depth=8, class_weight='balanced', random_state=42)
+dt.fit(X_tr, y_tr)
+print(f"   >> Árbol F1: {f1_score(y_val, dt.predict(X_val), average='macro'):.4f}")
 
-# División Temporal
-mask_pre = X_imputed['DisbursementDate_Year'] < SPLIT_YEAR
-mask_post = X_imputed['DisbursementDate_Year'] >= SPLIT_YEAR
-
-X_pre, y_pre = X_imputed[mask_pre], y[mask_pre]
-X_post, y_post = X_imputed[mask_post], y[mask_post]
-
-# Pesos específicos para cada época
-sw_pre = compute_sample_weight('balanced', y_pre)
-sw_post = compute_sample_weight('balanced', y_post)
-
-# Modelos con soporte para weights
-# Nota: XGBoost usa scale_pos_weight internamente o sample_weight en fit. Usaremos sample_weight en fit.
-models_def = {
-    'RF': RandomForestClassifier(n_estimators=300, max_depth=12, class_weight='balanced', n_jobs=-1, random_state=42),
-    'XGB': xgb.XGBClassifier(n_estimators=600, learning_rate=0.02, max_depth=6, subsample=0.8, n_jobs=-1, random_state=42)
-}
-
-test_probs = {k: [] for k in models_def.keys()}
-final_indices = []
-
-# --- BUCLE DE ENTRENAMIENTO POR ÉPOCA ---
-for era_name, X_era, y_era, sw_era, mask_test_era in [
-    ('PRE-2008', X_pre, y_pre, sw_pre, X_test_imputed['DisbursementDate_Year'] < SPLIT_YEAR),
-    ('POST-2008', X_post, y_post, sw_post, X_test_imputed['DisbursementDate_Year'] >= SPLIT_YEAR)
-]:
-    print(f"\n>> Procesando Era: {era_name} ({len(X_era)} muestras)")
-    
-    # Preparar test de esta era
-    X_test_era = X_test_imputed[mask_test_era].copy()
-    indices_era = X_test_era['original_index']
-    final_indices.extend(indices_era)
-    X_test_era = X_test_era.drop(columns=['original_index'])
-    
-    # Entrenar cada modelo
-    era_probs = {}
-    for m_name, model in models_def.items():
-        # Clonar modelo nuevo
-        m =  model.__class__(**model.get_params())
-        
-        # Entrenar con PESOS (sample_weight) es la clave
-        m.fit(X_era, y_era, sample_weight=sw_era)
-        
-        # Predecir
-        if len(X_test_era) > 0:
-            probs = m.predict_proba(X_test_era)[:, 1]
-            test_probs[m_name].extend(probs)
-        else:
-            print(f"   Advertencia: No hay datos de test para {era_name}")
+# Requisito 2: Geométrico
+geo = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42))
+geo.fit(X_tr, y_tr)
+print(f"   >> Geométrico F1: {f1_score(y_val, geo.predict(X_val), average='macro'):.4f}")
 
 # ==========================================
-# 6. ENSEMBLE Y SUBMISSION
+# 5. MODELO PRINCIPAL (ENSEMBLE V19)
 # ==========================================
-print("\nGenerando Ensemble...")
+print("\n" + "="*50)
+print("   FASE 2: ENTRENAMIENTO INICIAL")
+print("="*50)
 
-# Reordenar probabilidades para que coincidan con el orden original
-# Creamos un DF temporal para ordenar
-df_probs = pd.DataFrame({'index': final_indices})
-for m_name in models_def.keys():
-    df_probs[m_name] = test_probs[m_name]
+clf1 = xgb.XGBClassifier(n_estimators=1000, learning_rate=0.015, max_depth=8, subsample=0.7, colsample_bytree=0.7, n_jobs=-1, random_state=42)
+clf2 = RandomForestClassifier(n_estimators=500, max_depth=15, class_weight='balanced', n_jobs=-1, random_state=42)
+clf3 = HistGradientBoostingClassifier(learning_rate=0.05, max_iter=500, max_depth=10, l2_regularization=0.1, random_state=42)
 
-df_probs = df_probs.sort_values('index').set_index('index')
+ensemble = VotingClassifier(
+    estimators=[('xgb', clf1), ('rf', clf2), ('hgb', clf3)],
+    voting='soft',
+    weights=[5, 3, 2]
+)
 
-# Mezcla: RF suele ser muy bueno con clases desbalanceadas. XGBoost es potente.
-# Damos 50/50 o 60/40. Probemos 50/50 para robustez.
-final_prob = (0.5 * df_probs['XGB']) + (0.5 * df_probs['RF'])
-final_pred = (final_prob >= 0.5).astype(int)
+# Entrenamiento 1 (Standard)
+sample_weights = compute_sample_weight('balanced', y)
+ensemble.fit(X_imputed, y, sample_weight=sample_weights)
 
-submission = pd.DataFrame({'id': test['id'], 'Accept': final_pred.values})
-submission.to_csv('submission_balanced_final.csv', index=False)
-print("¡Archivo 'submission_balanced_final.csv' generado!")
-print("NOTA: Este modelo penaliza fuertemente fallar en los '0', lo que debería subir tu F1-Macro.")
+# ==========================================
+# 6. PSEUDO-LABELING (LA MAGIA PARA EL 0.80)
+# ==========================================
+print("\n" + "="*50)
+print("   FASE 3: PSEUDO-LABELING (Refuerzo)")
+print("="*50)
+
+# 1. Predecir probabilidades del Test
+probs_test = ensemble.predict_proba(X_test_imputed)
+
+# 2. Filtrar predicciones MUY seguras (>99% o <1%)
+# Cuanto más estricto sea el umbral, menos datos añadimos pero más seguros son.
+CONFIDENCE_THRESHOLD = 0.95 
+
+high_conf_indices = np.where((probs_test[:, 0] > CONFIDENCE_THRESHOLD) | (probs_test[:, 1] > CONFIDENCE_THRESHOLD))[0]
+pseudo_X_test = X_test_imputed.iloc[high_conf_indices]
+pseudo_y_test = (probs_test[high_conf_indices, 1] >= 0.5).astype(int)
+
+print(f"   > Muestras originales de Train: {len(X_imputed)}")
+print(f"   > Nuevas muestras 'seguras' del Test añadidas: {len(pseudo_X_test)}")
+
+if len(pseudo_X_test) > 0:
+    # 3. Añadir al Train
+    X_aug = pd.concat([X_imputed, pseudo_X_test], axis=0)
+    y_aug = pd.concat([y, pd.Series(pseudo_y_test)], axis=0)
+    
+    # Recalcular pesos para el nuevo set aumentado
+    aug_weights = compute_sample_weight('balanced', y_aug)
+    
+    print("   > Re-entrenando Ensemble con datos aumentados...")
+    
+    # Re-definir el ensemble para resetearlo (limpio)
+    # Importante: Usamos los mismos hiperparámetros
+    final_ensemble = VotingClassifier(
+        estimators=[('xgb', clf1), ('rf', clf2), ('hgb', clf3)],
+        voting='soft',
+        weights=[5, 3, 2]
+    )
+    
+    final_ensemble.fit(X_aug, y_aug, sample_weight=aug_weights)
+    model_for_prediction = final_ensemble
+else:
+    print("   > No hubo suficientes predicciones seguras. Usando modelo original.")
+    model_for_prediction = ensemble
+
+# ==========================================
+# 7. PREDICCIÓN FINAL
+# ==========================================
+print("\nGenerando predicciones finales...")
+final_preds = model_for_prediction.predict(X_test_imputed)
+
+submission = pd.DataFrame({'id': test['id'], 'Accept': final_preds})
+submission.to_csv('submission_v21_pseudo_labeling.csv', index=False)
+print("¡Archivo 'submission_v21_pseudo_labeling.csv' generado!")
+print("Estrategia: V19 Base + Academic Check + Pseudo-Labeling (Data Augmentation).")
