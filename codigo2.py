@@ -1,14 +1,12 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, classification_report
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+from sklearn.preprocessing import LabelEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.utils.class_weight import compute_sample_weight
 
 # ==========================================
 # 1. CARGA DE DATOS
@@ -24,248 +22,157 @@ test['Accept'] = np.nan
 df_all = pd.concat([train, test], axis=0).reset_index(drop=True)
 
 # ==========================================
-# 2. LIMPIEZA Y FEATURE ENGINEERING
+# 2. FEATURE ENGINEERING (SESGO INDUCTIVO)
 # ==========================================
-print("--- 2. Limpieza y Feature Engineering ---")
+print("--- 2. Aplicando Sesgos Inductivos ---")
+
+# A. Limpieza Estándar
+if 'BalanceGross' in df_all.columns: df_all.drop(columns=['BalanceGross'], inplace=True)
 
 def clean_currency(x):
-    if isinstance(x, str):
-        return float(x.replace('$', '').replace(',', '').strip())
+    if isinstance(x, str): return float(x.replace('$', '').replace(',', '').strip())
     return x
-
-for col in ['DisbursementGross', 'BalanceGross']:
-    if col in df_all.columns:
-        df_all[col] = df_all[col].apply(clean_currency)
+df_all['DisbursementGross'] = df_all['DisbursementGross'].apply(clean_currency)
 
 def clean_approval_fy(x):
     if pd.isna(x): return np.nan
     x = str(x).replace('A', '').strip() 
     try: return int(float(x)) 
     except: return np.nan
-
 df_all['ApprovalFY'] = df_all['ApprovalFY'].apply(clean_approval_fy)
 
-date_cols = ['ApprovalDate', 'DisbursementDate']
-for col in date_cols:
+for col in ['ApprovalDate', 'DisbursementDate']:
     df_all[col] = pd.to_datetime(df_all[col], errors='coerce')
-    df_all[f'{col}_Year'] = df_all[col].dt.year
-    df_all[f'{col}_Month'] = df_all[col].dt.month
+    years = df_all[col].dt.year
+    years = years.apply(lambda y: y - 100 if y > 2025 else y)
+    df_all[f'{col}_Year'] = years
 
 df_all['Days_To_Disbursement'] = (df_all['DisbursementDate'] - df_all['ApprovalDate']).dt.days
 
-def clean_binary(x):
-    if str(x).upper() in ['Y', 'YES', '1']: return 1
-    elif str(x).upper() in ['N', 'NO', '0']: return 0
-    else: return np.nan 
+# B. SESGO 1: TAMAÑO DE EMPRESA (Curva en U)
+# Micro(1) -> Riskier(2-5) -> Safe(>5) -> VerySafe(>20)
+df_all['NoEmp'] = df_all['NoEmp'].replace(0, 1)
+df_all['CompanySize_Cat'] = pd.cut(df_all['NoEmp'], 
+                                   bins=[-1, 1, 5, 20, 99999], 
+                                   labels=['Micro', 'Small', 'Medium', 'Large'])
 
+# C. SESGO 2: JERARQUÍA BANCARIA (Count Encoding)
+# Los bancos que prestan mucho tienen políticas distintas a los que prestan poco
+bank_counts = df_all['Bank'].value_counts()
+df_all['Bank_Size'] = df_all['Bank'].map(bank_counts)
+
+# D. Variables Categóricas y NLP
+df_all['Name'] = df_all['Name'].fillna('').astype(str).str.upper()
+df_all['Legal_Entity'] = df_all['Name'].apply(lambda x: 1 if any(w in x for w in ['LLC', 'INC', 'CORP', 'LTD']) else 0)
+df_all['Sector_Risk'] = df_all['Name'].apply(lambda x: 1 if any(w in x for w in ['REALTY', 'ESTATE', 'CONST', 'BUILD']) else 0)
+
+def clean_binary(x):
+    return 1 if str(x).upper() in ['Y','T','1'] else 0
 df_all['RevLineCr'] = df_all['RevLineCr'].apply(clean_binary)
 df_all['LowDoc'] = df_all['LowDoc'].apply(clean_binary)
+
 df_all['StateSame'] = (df_all['State'] == df_all['BankState']).astype(int)
+df_all['IsFranchise'] = df_all['FranchiseCode'].apply(lambda x: 0 if x <= 1 else 1)
+df_all['NewExist'] = df_all['NewExist'].replace({0.0: 1.0, np.nan: 1.0})
 
-if 'DisbursementDate_Year' in df_all.columns:
-    df_all['IsRecession'] = df_all['DisbursementDate_Year'].apply(lambda x: 1 if 2007 <= x <= 2009 else 0)
-
-df_all['NoEmp'] = df_all['NoEmp'].replace(0, 1)
-df_all['Amount_Per_Emp'] = df_all['DisbursementGross'] / df_all['NoEmp']
-
-# ==========================================
-# 3. ESTRATEGIA: AGRUPACIÓN DE BANCOS
-# ==========================================
-print("--- 3. Agrupando Bancos Pequeños ---")
-
-def group_rare_labels(df, col, n_top=20):
-    top_banks = df[col].value_counts().head(n_top).index.tolist()
-    new_col_name = f'{col}_Grouped'
-    df[new_col_name] = df[col].apply(lambda x: x if x in top_banks else 'Other_Small')
-    return df, new_col_name
-
-df_all, bank_col_grouped = group_rare_labels(df_all, 'Bank', n_top=25) 
-df_all, city_col_grouped = group_rare_labels(df_all, 'City', n_top=50)
+# Ratios
+df_all['Loan_Per_Emp'] = df_all['DisbursementGross'] / df_all['NoEmp']
+df_all['TotalJobs'] = df_all['CreateJob'] + df_all['RetainedJob']
+df_all['RevLine_Urban'] = df_all['RevLineCr'] * df_all['UrbanRural']
 
 # ==========================================
-# 4. ENCODING
+# 3. ENCODING
 # ==========================================
-print("--- 4. Encoding ---")
+if df_all['State'].nunique() <= 1: df_all.drop(columns=['State'], inplace=True, errors='ignore')
 
-cat_cols_high = [bank_col_grouped, city_col_grouped, 'BankState', 'FranchiseCode'] 
-cat_cols_low = ['State', 'NewExist', 'UrbanRural'] 
+def group_rare(df, col, n=40):
+    if col not in df.columns: return df, None
+    top = df[col].value_counts().head(n).index.tolist()
+    df[f'{col}_Grouped'] = df[col].apply(lambda x: x if x in top else 'Other')
+    return df, f'{col}_Grouped'
+
+df_all, bank_col = group_rare(df_all, 'Bank', 50)
+df_all, city_col = group_rare(df_all, 'City', 80)
 
 le = LabelEncoder()
-for col in cat_cols_low:
+# Añadimos CompanySize_Cat al Label Encoding
+for col in ['NewExist', 'UrbanRural', 'BankState', 'CompanySize_Cat']:
     df_all[col] = df_all[col].astype(str)
     df_all[col] = le.fit_transform(df_all[col])
 
-cols_to_drop = ['id', 'LoanNr_ChkDgt', 'Name', 'ApprovalDate', 'DisbursementDate', 
-                'is_train', 'Accept', 'Bank', 'City']
+# Target Encoding
+cols_drop = ['id', 'LoanNr_ChkDgt', 'Name', 'ApprovalDate', 'DisbursementDate', 
+             'is_train', 'Accept', 'Bank', 'City']
+cat_cols_te = [c for c in [bank_col, city_col, 'FranchiseCode'] if c]
 
 df_train = df_all[df_all['is_train'] == 1].copy()
 df_test = df_all[df_all['is_train'] == 0].copy()
 y = df_train['Accept'].astype(int)
 
-# Target Encoding
-for col in cat_cols_high:
-    mapping = df_train.groupby(col)['Accept'].mean()
-    df_train[f'{col}_TE'] = df_train[col].map(mapping)
-    df_test[f'{col}_TE'] = df_test[col].map(mapping)
-    
+for col in cat_cols_te:
     global_mean = y.mean()
-    df_train[f'{col}_TE'] = df_train[f'{col}_TE'].fillna(global_mean)
-    df_test[f'{col}_TE'] = df_test[f'{col}_TE'].fillna(global_mean)
-    
-    cols_to_drop.append(col)
+    agg = df_train.groupby(col)['Accept'].agg(['count', 'mean'])
+    smooth = (agg['count'] * agg['mean'] + 20 * global_mean) / (agg['count'] + 20)
+    df_train[f'{col}_TE'] = df_train[col].map(smooth).fillna(global_mean)
+    df_test[f'{col}_TE'] = df_test[col].map(smooth).fillna(global_mean)
+    cols_drop.append(col)
 
-X = df_train.drop(columns=cols_to_drop)
-X_test_final = df_test.drop(columns=cols_to_drop)
+X = df_train.drop(columns=cols_drop, errors='ignore')
+X_test_final = df_test.drop(columns=cols_drop, errors='ignore')
 
-# Imputación (manteniendo DataFrame para facilitar filtrado por año)
+# Imputación
 imputer = SimpleImputer(strategy='median')
 X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 X_test_imputed = pd.DataFrame(imputer.transform(X_test_final), columns=X_test_final.columns)
 
-# Guardamos índices de test para reconstruir orden
-X_test_imputed['original_index'] = X_test_imputed.index
-
 # ==========================================
-# 5. DEFINICIÓN DE MODELOS
-# ==========================================
-SPLIT_YEAR = 2008
-
-def get_models():
-    # Devuelve un diccionario con instancias nuevas de los modelos
-    return {
-        'LogisticRegression': make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, random_state=42)),
-        'DecisionTree': DecisionTreeClassifier(max_depth=10, random_state=42),
-        'RandomForest': RandomForestClassifier(n_estimators=200, max_depth=15, n_jobs=-1, random_state=42),
-        'XGBoost': xgb.XGBClassifier(n_estimators=500, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, n_jobs=-1, random_state=42, eval_metric='logloss')
-    }
-
-# ==========================================
-# 6. ENTRENAMIENTO Y VALIDACIÓN (TIME-SPLIT)
+# 4. CONFIGURACIÓN CON SESGO INDUCTIVO (MONOTONICIDAD)
 # ==========================================
 print("\n" + "="*50)
-print("   ENTRENAMIENTO TIME-SPLIT (PRE vs POST 2008)")
+print("   ENTRENANDO CON MONOTONICIDAD FORZADA")
 print("="*50)
 
-# Diccionario para guardar predicciones de TEST (probabilidades) de cada modelo
-test_probs = {model_name: pd.Series(index=X_test_imputed.index, dtype=float) for model_name in get_models().keys()}
-# Diccionario para guardar scores de validación
-val_scores = {}
+# Detectar índice de columna para restricción
+disbursement_col_idx = list(X.columns).index('DisbursementGross')
+# Crear tupla de restricciones: 0=Nada, 1=Creciente
+# Forzamos que DisbursementGross sea Creciente (Más dinero -> Más Aprobación)
+monotone_constraints = '(' + ','.join(['1' if c == 'DisbursementGross' else '0' for c in X.columns]) + ')'
 
-# --- A. Dividir Datos en Épocas ---
-train_mask_pre = X_imputed['DisbursementDate_Year'] < SPLIT_YEAR
-train_mask_post = X_imputed['DisbursementDate_Year'] >= SPLIT_YEAR
+# XGBoost con Inductive Bias
+xgb_clf = xgb.XGBClassifier(
+    n_estimators=1000, learning_rate=0.015, max_depth=8, 
+    subsample=0.7, colsample_bytree=0.7, n_jobs=-1, random_state=42,
+    monotone_constraints=monotone_constraints # <--- AQUÍ ESTÁ LA MAGIA
+)
 
-X_pre = X_imputed[train_mask_pre]
-y_pre = y[train_mask_pre]
-X_post = X_imputed[train_mask_post]
-y_post = y[train_mask_post]
+# Random Forest (Estabilidad)
+rf_clf = RandomForestClassifier(
+    n_estimators=500, max_depth=15, class_weight='balanced', 
+    n_jobs=-1, random_state=42
+)
 
-test_mask_pre = X_test_imputed['DisbursementDate_Year'] < SPLIT_YEAR
-test_mask_post = X_test_imputed['DisbursementDate_Year'] >= SPLIT_YEAR
+# Voting (Solo Expertos)
+eclf = VotingClassifier(
+    estimators=[('xgb', xgb_clf), ('rf', rf_clf)],
+    voting='soft',
+    weights=[6, 4]
+)
 
-# Separar Test y guardar índices
-X_test_pre = X_test_imputed[test_mask_pre].copy()
-idx_test_pre = X_test_pre['original_index']
-X_test_pre = X_test_pre.drop(columns=['original_index'])
+# Pesos de Balanceo
+sample_weights = compute_sample_weight('balanced', y)
 
-X_test_post = X_test_imputed[test_mask_post].copy()
-idx_test_post = X_test_post['original_index']
-X_test_post = X_test_post.drop(columns=['original_index'])
-
-# --- B. Bucle por Modelo ---
-models_dict = get_models() # Instancias base
-
-for name, _ in models_dict.items():
-    print(f"\nProcesando Modelo: {name}...")
-    
-    # 1. Validación Interna (Para saber qué tan bueno es)
-    # ---------------------------------------------------
-    # Split Pre
-    tr_pre, val_pre, y_tr_pre, y_val_pre = train_test_split(X_pre, y_pre, test_size=0.2, random_state=42)
-    # Split Post
-    tr_post, val_post, y_tr_post, y_val_post = train_test_split(X_post, y_post, test_size=0.2, random_state=42)
-    
-    # Instancias específicas
-    m_pre = get_models()[name] # Nueva instancia
-    m_post = get_models()[name] # Nueva instancia
-    
-    # Entrenar en Train parcial
-    m_pre.fit(tr_pre, y_tr_pre)
-    m_post.fit(tr_post, y_tr_post)
-    
-    # Evaluar
-    pred_val_pre = m_pre.predict(val_pre)
-    pred_val_post = m_post.predict(val_post)
-    
-    f1_pre = f1_score(y_val_pre, pred_val_pre, average='macro')
-    f1_post = f1_score(y_val_post, pred_val_post, average='macro')
-    
-    # Promedio ponderado
-    weighted_f1 = (f1_pre * len(val_pre) + f1_post * len(val_post)) / (len(val_pre) + len(val_post))
-    val_scores[name] = weighted_f1
-    print(f"   > F1 Pre-2008: {f1_pre:.4f} | F1 Post-2008: {f1_post:.4f} | Global Avg: {weighted_f1:.4f}")
-    
-    # 2. Entrenamiento Final y Predicción TEST
-    # ----------------------------------------
-    # Re-entrenamos con TODO el dato de la época (Train + Val) para máxima potencia
-    m_final_pre = get_models()[name]
-    m_final_pre.fit(X_pre, y_pre)
-    
-    m_final_post = get_models()[name]
-    m_final_post.fit(X_post, y_post)
-    
-    # Predecir Probabilidades en Test
-    probs_pre = m_final_pre.predict_proba(X_test_pre)[:, 1]
-    probs_post = m_final_post.predict_proba(X_test_post)[:, 1]
-    
-    # Reconstruir el vector completo de probabilidades
-    s_pre = pd.Series(probs_pre, index=idx_test_pre)
-    s_post = pd.Series(probs_post, index=idx_test_post)
-    s_total = pd.concat([s_pre, s_post]).sort_index()
-    
-    test_probs[name] = s_total
+print("Entrenando Ensemble Final...")
+eclf.fit(X_imputed, y, sample_weight=sample_weights)
 
 # ==========================================
-# 7. ENSEMBLE (MEZCLA DE EXPERTOS)
+# 5. SUBMISSION
 # ==========================================
-print("\n" + "="*50)
-print("   GENERANDO ENSEMBLE FINAL")
-print("="*50)
+print("Generando predicciones...")
+# Umbral ajustado manualmente a 0.45 (ligeramente conservador para capturar más 1s correctos)
+final_probs = eclf.predict_proba(X_test_imputed)[:, 1]
+final_preds = (final_probs >= 0.45).astype(int)
 
-# Definimos pesos basados en el rendimiento esperado (XGBoost y RF suelen mandar)
-# Puedes ajustar esto según los 'Global Avg' que veas en la consola
-weights = {
-    'XGBoost': 0.50,
-    'RandomForest': 0.30,
-    'DecisionTree': 0.15,
-    'LogisticRegression': 0.05
-}
-
-print("Pesos del Ensemble:", weights)
-
-final_blend_probs = np.zeros(len(test))
-
-for name, weight in weights.items():
-    final_blend_probs += test_probs[name].values * weight
-
-# Convertir a clase (0 o 1)
-final_blend_preds = (final_blend_probs >= 0.5).astype(int)
-
-# ==========================================
-# 8. GENERAR ARCHIVOS
-# ==========================================
-
-# A. Submission del Ensemble
-sub_ensemble = pd.DataFrame({'id': test['id'], 'Accept': final_blend_preds})
-sub_ensemble.to_csv('submission_ensemble_timesplit.csv', index=False)
-print("\n>> Archivo 'submission_ensemble_timesplit.csv' generado (Tu mejor apuesta).")
-
-# B. Submission del Mejor Individual (Por si acaso el ensemble falla)
-best_model_name = max(val_scores, key=val_scores.get)
-best_model_preds = (test_probs[best_model_name].values >= 0.5).astype(int)
-
-sub_best = pd.DataFrame({'id': test['id'], 'Accept': best_model_preds})
-sub_best.to_csv(f'submission_best_{best_model_name}_timesplit.csv', index=False)
-print(f">> Archivo 'submission_best_{best_model_name}_timesplit.csv' generado (Plan B).")
-
-print("\n¡Proceso Finalizado con Éxito! 🚀")
+submission = pd.DataFrame({'id': test['id'], 'Accept': final_preds})
+submission.to_csv('submission_v20_inductive_bias.csv', index=False)
+print("¡Archivo 'submission_v20_inductive_bias.csv' generado!")
+print(">> Sesgos aplicados: Monotonicidad en Dinero + Curva de Empresa + Tamaño Banco.")
