@@ -8,6 +8,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import RandomForestClassifier
 
 # ==========================================
 # 1. CARGA DE DATOS
@@ -164,7 +165,13 @@ pred_tree = model_tree.predict(X_val)
 f1_tree = f1_score(y_val, pred_tree, average='macro')
 print(f"         >> F1-Score: {f1_tree:.4f}")
 
-# MODELO C: ENSEMBLE (XGBoost)
+# MODELO C: Random Forest
+print("   [3/4] Random Forest...")
+model_rf = RandomForestClassifier(n_estimators=200, max_depth=15, n_jobs=-1, random_state=42)
+model_rf.fit(X_train, y_train)
+f1_rf = f1_score(y_val, model_rf.predict(X_val), average='macro')
+
+# MODELO D: ENSEMBLE (XGBoost)
 print("   [3/3] XGBoost (Ensemble)...")
 model_xgb = xgb.XGBClassifier(
     n_estimators=500,
@@ -184,30 +191,32 @@ print(f"         >> F1-Score: {f1_xgb:.4f}")
 # ==========================================
 # 6. SELECCIÓN Y SUBMISSION
 # ==========================================
-print("\n" + "="*30)
-print(f"FINAL: Geo: {f1_geo:.4f} | Tree: {f1_tree:.4f} | XGB: {f1_xgb:.4f}")
+print("\n" + "="*40)
+print(f"RESULTADOS FINAL ROUND:")
+print(f"1. Logistic Regression: {f1_geo:.4f}")
+print(f"2. Decision Tree:       {f1_tree:.4f}")
+print(f"3. Random Forest:       {f1_rf:.4f}")
+print(f"4. XGBoost:             {f1_xgb:.4f}")
 
-best_model = None
-model_name = ""
+# Selección automática del ganador
+scores = {'Logistic Regression': f1_geo, 'Decision Tree': f1_tree, 'Random Forest': f1_rf, 'XGBoost': f1_xgb}
+best_model_name = max(scores, key=scores.get)
+print(f"\n🏆 GANADOR: {best_model_name} con F1: {scores[best_model_name]:.4f}")
 
-if f1_xgb >= f1_tree and f1_xgb >= f1_geo:
-    best_model = model_xgb
-    model_name = "XGBoost"
-elif f1_tree > f1_geo:
-    best_model = model_tree
-    model_name = "Decision Tree"
+# Asignar objeto del modelo ganador
+if best_model_name == 'XGBoost':
+    final_model = model_xgb
+elif best_model_name == 'Random Forest':
+    final_model = model_rf
+elif best_model_name == 'Decision Tree':
+    final_model = model_tree
 else:
-    best_model = model_geo
-    model_name = "Logistic Regression"
+    final_model = model_geo
 
-print(f"¡Ganador: {model_name}! Generando submission...")
+print(f"Generando submission con {best_model_name} re-entrenado...")
 
-if model_name == "Logistic Regression":
-    best_model.fit(X_imputed, y)
-    final_preds = best_model.predict(X_test_imputed)
-else:
-    best_model.fit(X_imputed, y)
-    final_preds = best_model.predict(X_test_imputed)
+final_model.fit(X_imputed, y)
+final_preds = final_model.predict(X_test_imputed)
 
 submission = pd.DataFrame({'id': test['id'], 'Accept': final_preds})
 submission.to_csv('submission_final.csv', index=False)
