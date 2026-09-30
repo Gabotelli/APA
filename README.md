@@ -1,52 +1,52 @@
 # Loan approval classification — academic ML competition
 
-An academic competition to predict loan approval for **small and medium-sized enterprises (SMEs)** from tabular records. **Our team ranked 2nd out of 7 teams.** This is the course competition result reported in my CV; it is not an independently measured deployment metric.
+An academic competition to predict loan approval for **small and medium-sized enterprises (SMEs)** from tabular records. **Our team ranked 2nd out of 7 teams.**
 
-We used **Python, NumPy, pandas, scikit-learn, logistic regression, random forest, XGBoost, cross-validation and ensemble modelling**. The committed scripts retain experimental versions rather than a single finalized pipeline. The project record describes cross-validation; the active validation code in the six saved scripts is a single stratified holdout where present. Importing `StratifiedKFold` does not itself implement cross-validation.
+We used **Python, NumPy, pandas, scikit-learn, logistic regression, random forest, XGBoost, cross-validation and ensemble modelling**. This is a team academic project; no individual authorship breakdown is claimed for every script.
 
-## Experiments in this repository
+## Final competition versions
 
-| Script | Main experiment | Output written |
+The project owner confirmed that **`codigo3.py` and `codigo4.py` were the two best versions submitted in the final competition work**. Both are retained without changes to their modelling logic. The team ranking is not attributed to an individually verified score for either file.
+
+| Script | Approach | Output written |
 | --- | --- | --- |
-| `codigo5.py` | V4: cleaned tabular features, unsmoothed target encoding and balanced XGBoost; holdout macro-F1. | `submission_v4_optimized.csv` |
-| `codigo6.py` | V14: keyword features; separate decision-tree/logistic-regression checks; soft-voting XGBoost + random forest + HistGradientBoosting (5:3:2), with sample weights. | `submission_v14_giants_ensemble.csv` |
-| `codigo.py` | V19 restoration: three-model weighted ensemble and separate academic baseline checks. | `submission_v19_restoration.csv` (not currently tracked) |
-| `codigo2.py` | V20: company-size and bank-frequency features; monotonic XGBoost + random forest (6:4); prediction threshold 0.45. | `submission_v20_inductive_bias.csv` |
-| `codigo3.py` | V21: three-model ensemble followed by pseudo-labeling of test records above 0.95 confidence. | `submission_v21_pseudo_labeling.csv` |
-| `codigo4.py` | V22: constrained two-model ensemble, pseudo-labeling above 0.97 confidence, threshold 0.45. | `submission_v22_fusion_final.csv` |
+| [`codigo3.py`](codigo3.py) — V21 | Decision-tree and logistic-regression baseline checks; soft-voting XGBoost + random forest + HistGradientBoosting (5:3:2); pseudo-labeling above 0.95 confidence. | `submission_v21_pseudo_labeling.csv` |
+| [`codigo4.py`](codigo4.py) — V22 | XGBoost with a monotonic constraint on disbursement amount + random forest (6:4); pseudo-labeling above 0.97 confidence; final threshold 0.45. | `submission_v22_fusion_final.csv` |
 
-**Suggested starting point: `codigo6.py`.** It covers the academic baseline comparison and the main three-model ensemble without the later pseudo-labeling extensions. This is a presentation recommendation, not proof that V14 was the submission responsible for the final ranking. That specific final artifact remains to be confirmed.
+Start with `codigo3.py` to understand the baseline checks and three-model ensemble, then compare the constrained variant in `codigo4.py`. Earlier scripts have been removed from the current branch.
+
+The project record includes cross-validation, but the retained code does not implement it: `codigo3.py` checks baseline models on one stratified holdout, and `codigo4.py` has no active validation loop.
 
 ## Data and execution
 
 - `train.csv`: labeled records with binary `Accept`.
-- `test_nolabel.csv`: records used for competition predictions.
+- `test_nolabel.csv`: competition prediction records.
 - `sample_submission.csv`: expected submission schema.
-- 26 `submission_*.csv` files: saved experiment predictions, each with 7,050 rows and `id,Accept` columns. They contain no scores; even `submission_final_with_scores.csv` has only those two columns.
+- 26 `submission_*.csv` files: saved predictions with 7,050 rows and `id,Accept` columns. The two outputs listed above are the proposed retained final artifacts; deletion of the other 24 is pending approval.
 - `requirements.txt`: existing package requirements.
 
 In a virtual environment, run from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt
-python codigo6.py
+python codigo3.py
+# Alternatively:
+python codigo4.py
 ```
 
-This overwrites `submission_v14_giants_ensemble.csv`. Models use many estimators and can consume substantial time and memory. Syntax has been checked; full model retraining and equality with the saved submissions have not been verified.
+Each script overwrites its named submission file. Models use many estimators and can consume substantial time and memory. Full retraining and equality with the saved submissions have not been verified.
 
 ## Evaluation limitations
 
-- **Target leakage in validation:** target-encoding mappings use all training labels before the holdout split. Validation labels therefore influence their own features.
-- **Preprocessing leakage:** the median imputer is fitted on all labeled rows before splitting. Rare-category grouping and some encodings use concatenated train/test covariates; this is transductive preprocessing, not a clean inductive evaluation.
-- **No evaluated final ensemble in several scripts:** the holdout baseline scores do not measure the final full-data ensemble. Some versions have no active validation loop.
-- **Pseudo-labeling:** V21/V22 train again on predicted test labels. This is a transductive competition experiment and is not evidence of performance on new unseen businesses.
+- **Target leakage in validation:** target-encoding mappings use all training labels before the holdout split in `codigo3.py`. Validation labels therefore influence their own features.
+- **Preprocessing leakage:** its median imputer is fitted on all labeled rows before splitting. Both versions use concatenated train/test covariates for some feature construction, making preprocessing transductive.
+- **Final ensemble assessment:** the baseline holdout scores in V21 do not evaluate its final full-data ensemble. V22 has no active validation loop.
+- **Pseudo-labeling:** both versions train again on predicted test labels. This is a transductive competition experiment and is not evidence of performance on new unseen businesses.
 - **Feature timing:** disbursement dates and amounts need an availability audit before interpreting this as prediction at the original loan-application date.
-- Local scores, version names and score comments are not independently verified out-of-sample results. No numerical F1 claim is made here.
+- Local scores and score comments are not independently verified out-of-sample results. No numerical F1 claim is made here.
 
 A leakage-safe evaluation can preserve the project's purpose: split raw rows first, fit preprocessing inside training folds, cross-fit target encoding, and reserve an untouched holdout for final assessment. That changes the evaluation/model workflow and is **proposed only**, pending approval.
 
-## Proposed organization
+## Remaining organization proposal
 
-See [the cleanup proposal](docs/cleanup-proposal.md) for the `src/`, `data/` and `results/` layout, the exact submission retention list and the evaluation proposal. Scripts, model logic and saved submissions remain unchanged pending approval.
-
-This is a team academic project. The repository does not establish an individual authorship breakdown for every script.
+See [the cleanup proposal](docs/cleanup-proposal.md) for a `src/`, `data/` and `results/` layout, the exact submission retention proposal and the evaluation design. Input data, saved submissions and both final scripts remain unchanged.
