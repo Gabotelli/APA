@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# New runs preserve historical reference submissions
+/results/runs/
+/results/evaluation/
